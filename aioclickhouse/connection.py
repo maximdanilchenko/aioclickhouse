@@ -1,6 +1,9 @@
 import logging
 import asyncio
 from collections import namedtuple
+
+from async_timeout import timeout
+
 from aioclickhouse.writer import write_varint, write_binary_str
 from aioclickhouse.reader import read_binary_str, read_varint, read_exception
 from aioclickhouse.exceptions import UnexpectedPacketFromServerError
@@ -93,6 +96,36 @@ class Connection:
 
     def disconnect(self):
         self._writer.close()
+
+    async def ping(self):
+        timeout = self.sync_request_timeout
+
+        async with timeout(timeout):
+            try:
+                write_varint(ClientPacketTypes.PING, self.fout)
+                self.fout.flush()
+
+                packet_type = read_varint(self.fin)
+                while packet_type == ServerPacketTypes.PROGRESS:
+                    self.receive_progress()
+                    packet_type = read_varint(self.fin)
+
+                if packet_type != ServerPacketTypes.PONG:
+                    msg = self.unexpected_packet_message('Pong', packet_type)
+                    raise errors.UnexpectedPacketFromServerError(msg)
+
+            except errors.Error:
+                raise
+
+            except (socket.error, EOFError) as e:
+                # It's just a warning now.
+                # Current connection will be closed, new will be established.
+                logger.warning(
+                    'Error on %s ping: %s', self.get_description(), e
+                )
+                return False
+
+        return True
 
     def unexpected_packet_message(self, expected, packet_type):
         packet_type = ServerPacketTypes.to_str(packet_type)
