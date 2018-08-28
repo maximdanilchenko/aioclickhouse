@@ -26,7 +26,7 @@ DEFAULT_INSERT_BLOCK_SIZE = 1048576
 CLIENT_VERSION = 54337
 
 
-class ClientPacketTypes(IntEnum):
+class ClientPacketTypes:
     """
     Packet types that client transmits
     """
@@ -59,7 +59,7 @@ class ClientPacketTypes(IntEnum):
         return 'Unknown packet' if packet > 5 else cls._types_str[packet]
 
 
-class ServerPacketTypes(IntEnum):
+class ServerPacketTypes:
     """
     Packet types that server transmits.
     """
@@ -118,3 +118,11 @@ class CompressionMethodByte(IntEnum):
     LZ4 = 0x82
     ZSTD = 0x90
 
+
+class QueryProcessingStage(IntEnum):
+    """
+    Determines till which state SELECT query should be executed.
+    """
+    FETCH_COLUMNS = 0
+    WITH_MERGEABLE_STATE = 1
+    COMPLETE = 2

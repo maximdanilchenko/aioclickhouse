@@ -1,3 +1,4 @@
+import socket
 import logging
 import asyncio
 from collections import namedtuple
@@ -6,52 +7,67 @@ from async_timeout import timeout
 
 from aioclickhouse.writer import write_varint, write_binary_str
 from aioclickhouse.reader import read_binary_str, read_varint, read_exception
-from aioclickhouse.exceptions import UnexpectedPacketFromServerError
+from aioclickhouse.exceptions import UnexpectedPacketFromServerError, Error
 from aioclickhouse.constants import (
     ClientPacketTypes,
     ServerPacketTypes,
+    QueryProcessingStage,
+    Compression,
     DBMS_VERSION_MAJOR,
     DBMS_VERSION_MINOR,
     CLIENT_VERSION,
     DBMS_MIN_REVISION_WITH_SERVER_TIMEZONE,
+    DBMS_DEFAULT_SYNC_REQUEST_TIMEOUT_SEC,
+    DBMS_MIN_REVISION_WITH_CLIENT_INFO,
+)
+from aioclickhouse.progress import Progress
+from aioclickhouse.clientinfo import ClientInfo
+from aioclickhouse.settings.writer import write_settings
+from aioclickhouse.context import Context
+
+
+Packet = namedtuple(
+    "Packet", ["type", "block", "exception", "progress", "profile_info"]
 )
 
-
-Packet = namedtuple('Packet', [
-    'type',
-    'block',
-    'exception',
-    'progress',
-    'profile_info',
-])
-
-ServerInfo = namedtuple('ServerInfo', [
-    'name',
-    'version_major',
-    'version_minor',
-    'revision',
-    'timezone',
-])
+ServerInfo = namedtuple(
+    "ServerInfo", ["name", "version_major", "version_minor", "revision", "timezone"]
+)
 
 
 class Connection:
     def __init__(
-        self, host="127.0.0.1", port=9000, *, database, user, password, loop=None
+        self,
+        host="127.0.0.1",
+        port=9000,
+        *,
+        database="default",
+        user="default",
+        password="",
+        loop=None,
+        sync_request_timeout=DBMS_DEFAULT_SYNC_REQUEST_TIMEOUT_SEC,
     ):
         self.host = host
         self.port = port
         self._writer: asyncio.StreamWriter = None
         self._reader: asyncio.StreamReader = None
         self._connected = False
-        self._loop: asyncio.BaseEventLoop = loop or asyncio.get_event_loop
+        self._loop: asyncio.BaseEventLoop = loop or asyncio.get_event_loop()
         self.database = database
         self.user = user
         self.password = password
-        self.client_name = 'aioclickhouse_python'
+        self.client_name = "aioclickhouse_python"
         self.server_info = None
+        self.sync_request_timeout = sync_request_timeout
+        self.context = Context()
+        self.compression = Compression.DISABLED
+        self.compressor_cls = None
+        self.compress_block_size = None
 
     async def connect(self):
-        self._reader, self._writer = await asyncio.open_connection(self.host, self.port, loop=self._loop)
+        self._reader, self._writer = await asyncio.open_connection(
+            self.host, self.port, loop=self._loop
+        )
         self._connected = True
         await self.send_hello()
         await self.receive_hello()
@@ -83,57 +99,87 @@ class Connection:
                 server_timezone = await read_binary_str(self._reader)
 
             self.server_info = ServerInfo(
-                server_name, server_version_major, server_version_minor,
-                server_revision, server_timezone
+                server_name,
+                server_version_major,
+                server_version_minor,
+                server_revision,
+                server_timezone,
             )
+            self.context.server_info = self.server_info
         elif packet_type == ServerPacketTypes.EXCEPTION:
             raise await read_exception(self._reader)
         else:
             self.disconnect()
-            message = self.unexpected_packet_message('Hello or Exception',
-                                                     packet_type)
+            message = self.unexpected_packet_message("Hello or Exception", packet_type)
             raise UnexpectedPacketFromServerError(message)
 
     def disconnect(self):
         self._writer.close()
 
     async def ping(self):
-        timeout = self.sync_request_timeout
 
-        async with timeout(timeout):
+        async with timeout(self.sync_request_timeout):
             try:
-                write_varint(ClientPacketTypes.PING, self.fout)
-                self.fout.flush()
+                write_varint(ClientPacketTypes.PING, self._writer)
+                self._writer.drain()
 
-                packet_type = read_varint(self.fin)
+                packet_type = await read_varint(self._reader)
                 while packet_type == ServerPacketTypes.PROGRESS:
                     self.receive_progress()
-                    packet_type = read_varint(self.fin)
+                    packet_type = await read_varint(self._reader)
 
                 if packet_type != ServerPacketTypes.PONG:
-                    msg = self.unexpected_packet_message('Pong', packet_type)
-                    raise errors.UnexpectedPacketFromServerError(msg)
+                    msg = self.unexpected_packet_message("Pong", packet_type)
+                    raise UnexpectedPacketFromServerError(msg)
 
-            except errors.Error:
+            except Error:
                 raise
 
             except (socket.error, EOFError) as e:
                 # It's just a warning now.
                 # Current connection will be closed, new will be established.
-                logger.warning(
-                    'Error on %s ping: %s', self.get_description(), e
-                )
+                logging.warning("Error on %s ping: %s", self.get_description(), e)
                 return False
 
         return True
 
+    async def send_query(self, query, query_id=None):
+        if not self._connected:
+            await self.connect()
+
+        write_varint(ClientPacketTypes.QUERY, self._writer)
+
+        write_binary_str(query_id or '', self._writer)
+
+        revision = self.server_info.revision
+        if revision >= DBMS_MIN_REVISION_WITH_CLIENT_INFO:
+            client_info = ClientInfo(self.client_name)
+            client_info.query_kind = ClientInfo.QueryKind.INITIAL_QUERY
+
+            client_info.write(revision, self._writer)
+
+        write_settings(self.context.settings, self._writer)
+
+        write_varint(QueryProcessingStage.COMPLETE, self._writer)
+        write_varint(self.compression, self._writer)
+
+        write_binary_str(query, self._writer)
+
+        logging.debug('Query: %s', query)
+
+        await self._writer.drain()
+
+    def receive_progress(self):
+        progress = Progress()
+        progress.read(self.server_info.revision, self._reader)
+        return progress
+
     def unexpected_packet_message(self, expected, packet_type):
         packet_type = ServerPacketTypes.to_str(packet_type)
 
-        return (
-            'Unexpected packet from server {} (expected {}, got {})'
-            .format(self.get_description(), expected, packet_type)
+        return "Unexpected packet from server {} (expected {}, got {})".format(
+            self.get_description(), expected, packet_type
         )
 
     def get_description(self):
-        return '{}:{}'.format(self.host, self.port)
+        return "{}:{}".format(self.host, self.port)
