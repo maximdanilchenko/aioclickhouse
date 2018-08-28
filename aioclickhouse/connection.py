@@ -125,7 +125,7 @@ class Connection:
 
                 packet_type = await read_varint(self._reader)
                 while packet_type == ServerPacketTypes.PROGRESS:
-                    self.receive_progress()
+                    await self.receive_progress()
                     packet_type = await read_varint(self._reader)
 
                 if packet_type != ServerPacketTypes.PONG:
@@ -169,9 +169,9 @@ class Connection:
 
         await self._writer.drain()
 
-    def receive_progress(self):
+    async def receive_progress(self):
         progress = Progress()
-        progress.read(self.server_info.revision, self._reader)
+        await progress.read(self.server_info.revision, self._reader)
         return progress
 
     def unexpected_packet_message(self, expected, packet_type):

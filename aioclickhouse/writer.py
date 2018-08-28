@@ -1,6 +1,5 @@
 import asyncio
 import struct
-import logging
 
 MAX_UINT64 = (1 << 64) - 1
 
