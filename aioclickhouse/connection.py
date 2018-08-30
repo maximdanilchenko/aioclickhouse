@@ -19,6 +19,7 @@ from aioclickhouse.constants import (
     DBMS_MIN_REVISION_WITH_SERVER_TIMEZONE,
     DBMS_DEFAULT_SYNC_REQUEST_TIMEOUT_SEC,
     DBMS_MIN_REVISION_WITH_CLIENT_INFO,
+    DBMS_MIN_REVISION_WITH_TEMPORARY_TABLES,
 )
 from aioclickhouse.progress import Progress
 from aioclickhouse.clientinfo import ClientInfo
@@ -168,6 +169,52 @@ class Connection:
         logging.debug('Query: %s', query)
 
         await self._writer.drain()
+
+    async def receive_data(self):
+        revision = self.server_info.revision
+
+        if revision >= DBMS_MIN_REVISION_WITH_TEMPORARY_TABLES:
+            await read_binary_str(self._reader)
+
+        block = self.block_in.read()
+        self.block_in.reset()
+        return block
+
+    async def receive_packet(self):
+        packet = Packet()
+
+        packet.type = packet_type = await read_varint(self._reader)
+
+        if packet_type == ServerPacketTypes.DATA:
+            packet.block = await self.receive_data()
+
+        elif packet_type == ServerPacketTypes.EXCEPTION:
+            packet.exception = await self.receive_exception()
+
+        elif packet.type == ServerPacketTypes.PROGRESS:
+            packet.progress = await self.receive_progress()
+
+        elif packet.type == ServerPacketTypes.PROFILE_INFO:
+            packet.profile_info = await self.receive_profile_info()
+
+        elif packet_type == ServerPacketTypes.TOTALS:
+            packet.block = await self.receive_data()
+
+        elif packet_type == ServerPacketTypes.EXTREMES:
+            packet.block = await self.receive_data()
+
+        elif packet_type == ServerPacketTypes.END_OF_STREAM:
+            pass
+
+        else:
+            self.disconnect()
+            raise errors.UnknownPacketFromServerError(
+                'Unknown packet {} from server {}'.format(
+                    packet_type, self.get_description()
+                )
+            )
+
+        return packet
 
     async def receive_progress(self):
         progress = Progress()
