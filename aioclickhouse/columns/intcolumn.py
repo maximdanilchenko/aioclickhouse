@@ -1,0 +1,99 @@
+
+from .exceptions import ColumnTypeMismatchException
+from .base import FormatColumn
+
+__all__ = [
+    "Int8Column",
+    "Int16Column",
+    "Int32Column",
+    "Int64Column",
+    "UInt8Column",
+    "UInt16Column",
+    "UInt32Column",
+    "UInt64Column",
+]
+
+
+class IntColumn(FormatColumn):
+    py_types = (int, )
+    int_size = None
+
+    def __init__(self, types_check=False, **kwargs):
+        super().__init__(types_check=types_check, **kwargs)
+
+        if types_check:
+            self.mask = (1 << 8 * self.int_size) - 1
+
+            # Chop only bytes that fit current type.
+            # ctypes.c_intXX is slower.
+            def before_write_item(value):
+                if value >= 0:
+                    sign = 1
+                else:
+                    sign = -1
+                    value = -value
+
+                return sign * (value & self.mask)
+
+            self.before_write_item = before_write_item
+
+
+class UIntColumn(IntColumn):
+    def __init__(self, types_check=False, **kwargs):
+        super().__init__(types_check=types_check, **kwargs)
+
+        if types_check:
+
+            def check_item(value):
+                if value < 0:
+                    raise ColumnTypeMismatchException(value)
+
+            self.check_item = check_item
+
+
+class Int8Column(IntColumn):
+    ch_type = "Int8"
+    format = "b"
+    int_size = 1
+
+
+class Int16Column(IntColumn):
+    ch_type = "Int16"
+    format = "h"
+    int_size = 2
+
+
+class Int32Column(IntColumn):
+    ch_type = "Int32"
+    format = "i"
+    int_size = 4
+
+
+class Int64Column(IntColumn):
+    ch_type = "Int64"
+    format = "q"
+    int_size = 8
+
+
+class UInt8Column(UIntColumn):
+    ch_type = "UInt8"
+    format = "B"
+    int_size = 1
+
+
+class UInt16Column(UIntColumn):
+    ch_type = "UInt16"
+    format = "H"
+    int_size = 2
+
+
+class UInt32Column(UIntColumn):
+    ch_type = "UInt32"
+    format = "I"
+    int_size = 4
+
+
+class UInt64Column(UIntColumn):
+    ch_type = "UInt64"
+    format = "Q"
+    int_size = 8
