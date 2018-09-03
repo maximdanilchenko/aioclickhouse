@@ -1,0 +1,192 @@
+from struct import Struct, error as struct_error
+
+from . import exceptions
+
+
+class Column:
+    ch_type = None
+    py_types = None
+
+    check_item = None
+    after_read_item = None
+    before_write_item = None
+
+    types_check_enabled = False
+
+    def __init__(self, types_check=False, **kwargs):
+        self.nullable = False
+        self.types_check_enabled = types_check
+
+    def make_null_struct(self, n_items):
+        return Struct('<{}B'.format(n_items))
+
+    async def _read_nulls_map(self, n_items, buf):
+        s = self.make_null_struct(n_items)
+        return s.unpack(await buf.read(s.size))
+
+    def _write_nulls_map(self, items, buf):
+        s = self.make_null_struct(len(items))
+        items = [x is None for x in items]
+        buf.write(s.pack(*items))
+
+    def prepare_null(self, value):
+        if self.nullable and value is None:
+            return 0, True
+
+        else:
+            return value, False
+
+    def check_item_type(self, value):
+        if not isinstance(value, self.py_types):
+            raise exceptions.ColumnTypeMismatchException(value)
+
+    def prepare_items(self, items):
+        before_write = self.before_write_item
+        prepare_null = self.prepare_null if self.nullable else False
+
+        check_item = self.check_item
+        if self.types_check_enabled:
+            check_item_type = self.check_item_type
+        else:
+            check_item_type = False
+
+        prepared = [None] * len(items)
+        for i, x in enumerate(items):
+            if prepare_null:
+                x, is_null = prepare_null(x)
+            else:
+                is_null = False
+
+            if not is_null:
+                if check_item_type:
+                    check_item_type(x)
+
+                if check_item:
+                    check_item(x)
+
+                if before_write:
+                    x = before_write(x)
+
+            prepared[i] = x
+
+        return prepared
+
+    def write_data(self, items, buf):
+        if self.nullable:
+            self._write_nulls_map(items, buf)
+
+        self._write_data(items, buf)
+
+    def _write_data(self, items, buf):
+        prepared = self.prepare_items(items)
+        self.write_items(prepared, buf)
+
+    def write_items(self, items, buf):
+        raise NotImplementedError
+
+    async def read_data(self, n_items, buf):
+        if self.nullable:
+            nulls_map = await self._read_nulls_map(n_items, buf)
+        else:
+            nulls_map = None
+
+        return await self._read_data(n_items, buf, nulls_map=nulls_map)
+
+    async def _read_data(self, n_items, buf, nulls_map=None):
+        after_read = self.after_read_item
+
+        items = await self.read_items(n_items, buf)
+
+        if nulls_map is not None:
+            if after_read:
+                items = tuple(
+                    (None if is_null else after_read(items[i]))
+                    for i, is_null in enumerate(nulls_map)
+                )
+            else:
+                items = tuple(
+                    (None if is_null else items[i])
+                    for i, is_null in enumerate(nulls_map)
+                )
+
+        else:
+            if after_read:
+                items = (after_read(x) for x in items)
+
+        return tuple(items)
+
+    async def read_items(self, n_items, buf):
+        raise NotImplementedError
+
+
+class FormatColumn(Column):
+    """
+    Uses struct.pack for bulk items writing.
+    """
+
+    format = None
+
+    def make_struct(self, n_items):
+        return Struct('<{}{}'.format(n_items, self.format))
+
+    def write_items(self, items, buf):
+        s = self.make_struct(len(items))
+        try:
+            buf.write(s.pack(*items))
+
+        except struct_error as e:
+            raise exceptions.StructPackException(e)
+
+    async def read_items(self, n_items, buf):
+        s = self.make_struct(n_items)
+        return s.unpack(await buf.read(s.size))
+
+
+class CustomItemColumn(Column):
+    """
+    Providers per item read/write functions.
+    This column should be used when column can't be bulk-processed.
+    """
+
+    def read(self, buf):
+        raise NotImplementedError
+
+    def _read_null(self, buf):
+        raise NotImplementedError
+
+    def write(self, value, buf):
+        raise NotImplementedError
+
+    def _write_null(self, buf):
+        raise NotImplementedError
+
+    def _write_data(self, items, buf):
+        if self.types_check_enabled:
+            check_item_type = self.check_item_type
+        else:
+            check_item_type = False
+
+        for x in items:
+            self.write_item(x, buf, check_item_type)
+
+    def write_item(self, x, buf, check_item_type):
+        if self.nullable and x is None:
+            self._write_null(buf)
+
+        else:
+            if check_item_type:
+                check_item_type(x)
+
+            self.write(x, buf)
+
+    def _read_data(self, n_items, buf, nulls_map=None):
+        if nulls_map is not None:
+            return tuple(
+                self.read_item(buf, is_null=is_null) for is_null in nulls_map
+            )
+
+        else:
+            return tuple(self.read(buf) for i in range(n_items))
+
+    def read_item(self, buf, is_null=False):
+        return self._read_null(buf) if is_null else self.read(buf)

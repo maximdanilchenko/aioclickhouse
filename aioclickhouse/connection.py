@@ -7,7 +7,7 @@ from async_timeout import timeout
 
 from aioclickhouse.writer import write_varint, write_binary_str
 from aioclickhouse.reader import read_binary_str, read_varint, read_exception
-from aioclickhouse.exceptions import UnexpectedPacketFromServerError, Error
+from aioclickhouse.exceptions import UnexpectedPacketFromServerError, Error, UnknownPacketFromServerError
 from aioclickhouse.constants import (
     ClientPacketTypes,
     ServerPacketTypes,
@@ -25,6 +25,8 @@ from aioclickhouse.progress import Progress
 from aioclickhouse.clientinfo import ClientInfo
 from aioclickhouse.settings.writer import write_settings
 from aioclickhouse.context import Context
+from .streams.native import BlockInputStream
+from .streams.native import BlockOutputStream
 
 
 Packet = namedtuple(
@@ -65,6 +67,10 @@ class Connection:
         self.compressor_cls = None
         self.compress_block_size = None
 
+        # Block writer/reader
+        self.block_in = None
+        self.block_out = None
+
     async def connect(self):
         self._reader, self._writer = await asyncio.open_connection(
             self.host, self.port, loop=self._loop
@@ -72,6 +78,10 @@ class Connection:
         self._connected = True
         await self.send_hello()
         await self.receive_hello()
+
+        self.block_in = self.get_block_in_stream()
+        self.block_out = self.get_block_out_stream()
+
         logging.debug(f"{self} connected")
 
     async def send_hello(self):
@@ -208,7 +218,7 @@ class Connection:
 
         else:
             self.disconnect()
-            raise errors.UnknownPacketFromServerError(
+            raise UnknownPacketFromServerError(
                 'Unknown packet {} from server {}'.format(
                     packet_type, self.get_description()
                 )
@@ -230,3 +240,9 @@ class Connection:
 
     def get_description(self):
         return "{}:{}".format(self.host, self.port)
+
+    def get_block_in_stream(self):
+        return BlockInputStream(self.fin, self.context)
+
+    def get_block_out_stream(self):
+        return BlockOutputStream(self.fout, self.context)
